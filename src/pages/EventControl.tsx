@@ -12,7 +12,6 @@ import LotteryOrganizer from '../components/LotteryOrganizer';
 import { PUBLIC_APP_URL } from '../constants';
 import { getReadableTextColor } from '../utils/color';
 import { serverNow } from '../firebase/serverTime';
-import { triggerHapticEvent, type HapticEventType } from '../firebase/haptics';
 import '../styles/audience-lottery-polish.css';
 
 function getAudioMimeType(file: File) { const n = file.name.toLowerCase(); if (n.endsWith('.mp3') || n.endsWith('.mpeg')) return 'audio/mpeg'; if (n.endsWith('.m4a') || n.endsWith('.mp4')) return 'audio/mp4'; if (n.endsWith('.wav')) return 'audio/wav'; if (n.endsWith('.ogg') || n.endsWith('.oga')) return 'audio/ogg'; if (n.endsWith('.webm')) return 'audio/webm'; if (n.endsWith('.aac')) return 'audio/aac'; if (n.endsWith('.flac')) return 'audio/flac'; return file.type || 'audio/mpeg'; }

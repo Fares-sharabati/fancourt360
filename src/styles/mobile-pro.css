@@ -458,6 +458,7 @@
   width: 100vw;
   height: 100dvh;
   background: var(--flash-accent, #fff);
+  filter: brightness(1.28) saturate(1.08);
   pointer-events: none;
 }
 

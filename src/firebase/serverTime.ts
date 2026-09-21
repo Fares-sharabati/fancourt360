@@ -2,42 +2,56 @@ import { onValue, ref, type Unsubscribe } from 'firebase/database';
 import { db } from './config';
 
 /**
- * Firebase Realtime Database exposes a special, always-available node at
- * `.info/serverTimeOffset` containing the number of milliseconds between the
- * client's local clock and the Firebase server's clock. Phones can have
- * clocks that are off by a few seconds (wrong timezone data, no NTP sync,
- * battery-saver throttling, etc.), which is enough to visibly desync a
- * 10-second countdown across a crowd.
+ * Shared clock used by the show scheduler.
  *
- * Call `now()` anywhere you would have called `Date.now()` for something
- * that needs to agree with other clients (countdown math, show-sync math).
+ * We anchor Firebase's server-time estimate to performance.now() instead of
+ * repeatedly doing Date.now() + offset. This keeps the clock monotonic during
+ * a show even if the phone's wall clock changes.
  */
-
 let cachedOffset = 0;
+let anchorServerMs = Date.now();
+let anchorPerformanceMs = typeof performance !== 'undefined' ? performance.now() : 0;
 let subscriberCount = 0;
 let stopListening: Unsubscribe | null = null;
+
+function performanceNow() {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function applyOffset(offsetMs: number) {
+  cachedOffset = offsetMs;
+  anchorServerMs = Date.now() + offsetMs;
+  anchorPerformanceMs = performanceNow();
+}
 
 function startListening() {
   if (stopListening) return;
   stopListening = onValue(ref(db, '.info/serverTimeOffset'), snapshot => {
     const value = snapshot.val();
-    cachedOffset = typeof value === 'number' ? value : 0;
+    applyOffset(typeof value === 'number' ? value : 0);
   });
 }
 
-/** Best-effort server-corrected timestamp. Falls back to local time until the first offset arrives. */
+/** Monotonic best-effort Firebase-server timestamp in milliseconds. */
 export function serverNow(): number {
-  return Date.now() + cachedOffset;
+  return anchorServerMs + (performanceNow() - anchorPerformanceMs);
 }
 
-/** Subscribe to live offset updates (in ms). Returns an unsubscribe function. */
+export function getServerTimeOffset(): number {
+  return cachedOffset;
+}
+
+/** Subscribe to live Firebase server-clock offset updates. */
 export function watchServerTimeOffset(callback: (offsetMs: number) => void): Unsubscribe {
   startListening();
   subscriberCount += 1;
+
   const stop = onValue(ref(db, '.info/serverTimeOffset'), snapshot => {
-    const value = snapshot.val();
-    callback(typeof value === 'number' ? value : 0);
+    const value = typeof snapshot.val() === 'number' ? snapshot.val() : 0;
+    applyOffset(value);
+    callback(value);
   });
+
   return () => {
     stop();
     subscriberCount -= 1;

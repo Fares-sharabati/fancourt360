@@ -9,7 +9,6 @@ import { registerParticipant } from '../firebase/participants';
 import { getLightStateAtTime, getNextLightEvent, type LightTimeline } from '../lightSync/timeline';
 import { serverNow, watchServerTimeOffset } from '../firebase/serverTime';
 import { getReadableTextColor } from '../utils/color';
-import { initializeHapticAudio, triggerHaptic, watchHapticEvent } from '../firebase/haptics';
 import { useLanguage, useTranslate, type Language } from '../i18n/LanguageContext';
 
 type TorchConstraints = MediaTrackConstraintSet & { torch?: boolean };
@@ -41,35 +40,63 @@ export default function Join() {
   const t = useTranslate();
   function noticeText(notice: Notice): string { if (!notice) return ''; if (notice.key === 'join-failed' && notice.detail) return t({ tr: `Etkinliğe katılınamadı: ${notice.detail}`, en: `Could not join the show: ${notice.detail}` }); return NOTICE_TEXT[notice.key][language]; }
   const [event, setEvent] = useState<PublicShow | null>(null); const [game, setGame] = useState<SportsGame | null>(null); const [activeInteraction, setActiveInteraction] = useState<SportsInteraction | null>(null); const [loaded, setLoaded] = useState(false); const [joined, setJoined] = useState(false); const [notice, setNotice] = useState<Notice>(null); const [lightState, setLightState] = useState(false); const [selectedOption, setSelectedOption] = useState(''); const [answer, setAnswer] = useState(''); const [message, setMessage] = useState<Notice>(null); const [sending, setSending] = useState(false); const [submittedInteractionId, setSubmittedInteractionId] = useState<string | null>(null);
-  const trackRef = useRef<MediaStreamTrack | null>(null); const nextTimerRef = useRef<number | null>(null); const currentLightRef = useRef(false); const lastHapticTimestampRef = useRef(0);
+  const trackRef = useRef<MediaStreamTrack | null>(null); const nextTimerRef = useRef<number | null>(null); const currentLightRef = useRef(false); const flashCommandRef = useRef(0);
   useEffect(() => watchServerTimeOffset(() => {}), []);
   useEffect(() => { if (!eventId) { setLoaded(true); setNotice({ key: 'invalid-link', isError: true }); return; } const showId = eventId; let cancelled = false; let stopShow: (() => void) | undefined; let stopGame: (() => void) | undefined; let stopInteractions: (() => void) | undefined; async function connect() { try { await ensureAnonymousAuth(); if (cancelled) return; stopShow = watchPublicShow(showId, show => { if (cancelled) return; setEvent(show); setLoaded(true); if (!show) setNotice({ key: 'not-found', isError: true }); }); stopGame = watchSportsGame(showId, setGame); stopInteractions = watchSportsInteractions(showId, items => setActiveInteraction(items.find(item => item.status === 'open') ?? null)); } catch (err) { console.error(err); if (!cancelled) { setLoaded(true); setNotice({ key: 'connect-failed', isError: true }); } } } void connect(); return () => { cancelled = true; stopShow?.(); stopGame?.(); stopInteractions?.(); }; }, [eventId]);
   useEffect(() => { setSelectedOption(''); setAnswer(''); setMessage(null); setSending(false); setSubmittedInteractionId(null); if (!eventId || !activeInteraction) return; let cancelled = false; const interactionId = activeInteraction.id; void (async () => { try { const uid = (await ensureAnonymousAuth()).uid; const already = await hasRespondedToInteraction(eventId, interactionId, uid); if (!cancelled && already) setSubmittedInteractionId(interactionId); } catch (err) { console.error(err); } })(); return () => { cancelled = true; }; }, [eventId, activeInteraction?.id]);
   function clearNextTimer() { if (nextTimerRef.current !== null) window.clearTimeout(nextTimerRef.current); nextTimerRef.current = null; }
-  async function setFlash(enabled: boolean) { const track = trackRef.current; if (!track || currentLightRef.current === enabled) return; try { await track.applyConstraints({ advanced: [{ torch: enabled } as TorchConstraints] }); currentLightRef.current = enabled; setLightState(enabled); } catch (err) { console.error(err); setNotice({ key: 'flash-control-failed', isError: true }); } }
-  function scheduleNextEvent(timeline: LightTimeline, start: number, offsetMs: number) { clearNextTimer(); const now = serverNow(); if (now < start) { nextTimerRef.current = window.setTimeout(() => synchronizeShow(start, timeline, offsetMs / 1000), Math.max(0, start - now)); return; } const position = now - start + offsetMs; const next = getNextLightEvent(timeline, position); if (!next) return; const eventAt = start + next.time - offsetMs; nextTimerRef.current = window.setTimeout(() => { const currentPosition = serverNow() - start + offsetMs; void setFlash(getLightStateAtTime(timeline, currentPosition)); scheduleNextEvent(timeline, start, offsetMs); }, Math.max(0, eventAt - now)); }
-  function synchronizeShow(start: number, timeline: LightTimeline, offsetSeconds = 0) { const offsetMs = Math.max(0, offsetSeconds) * 1000; const now = serverNow(); const position = now >= start ? now - start + offsetMs : -1; void setFlash(position >= 0 ? getLightStateAtTime(timeline, position) : false); scheduleNextEvent(timeline, start, offsetSeconds); }
+  function setFlash(enabled: boolean) {
+    const commandId = ++flashCommandRef.current;
+    if (currentLightRef.current === enabled) return;
+
+    // Update the screen immediately. Do NOT wait for the camera torch API:
+    // applyConstraints() can take tens/hundreds of milliseconds and used to
+    // delay the visible screen flash by exactly that amount.
+    currentLightRef.current = enabled;
+    setLightState(enabled);
+
+    const track = trackRef.current;
+    if (!track) return;
+
+    void track.applyConstraints({ advanced: [{ torch: enabled } as TorchConstraints] })
+      .catch(err => {
+        console.error(err);
+        if (commandId === flashCommandRef.current) {
+          setNotice({ key: 'flash-control-failed', isError: true });
+        }
+      });
+  }
+  function scheduleNextEvent(timeline: LightTimeline, start: number, offsetMs: number) {
+    clearNextTimer();
+    const now = serverNow();
+    if (now < start) {
+      nextTimerRef.current = window.setTimeout(() => synchronizeShow(start, timeline, offsetMs / 1000), Math.max(0, start - now));
+      return;
+    }
+    const position = now - start + offsetMs;
+    const next = getNextLightEvent(timeline, position);
+    if (!next) return;
+    const eventAt = start + next.time - offsetMs;
+    // Recalculate against the shared server clock every cycle. This avoids
+    // cumulative drift from chained setTimeout() delays.
+    nextTimerRef.current = window.setTimeout(() => {
+      const currentPosition = serverNow() - start + offsetMs;
+      setFlash(getLightStateAtTime(timeline, currentPosition));
+      scheduleNextEvent(timeline, start, offsetMs);
+    }, Math.max(0, eventAt - now));
+  }
+  function synchronizeShow(start: number, timeline: LightTimeline, offsetSeconds = 0) {
+    const offsetMs = Math.max(0, offsetSeconds) * 1000;
+    const now = serverNow();
+    const position = now >= start ? now - start + offsetMs : -1;
+    setFlash(position >= 0 ? getLightStateAtTime(timeline, position) : false);
+    scheduleNextEvent(timeline, start, offsetSeconds);
+  }
   async function joinShow() { if (!eventId || !event) return; setNotice(null); initializeHapticAudio(); let torchNotice: Notice = null; if (navigator.mediaDevices?.getUserMedia) { try { const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false }); const track = stream.getVideoTracks()[0]; const capabilities = track?.getCapabilities?.() as TorchCapabilities | undefined; if (track && capabilities?.torch) trackRef.current = track; else { stream.getTracks().forEach(track => track.stop()); torchNotice = { key: 'torch-unsupported', isError: false }; } } catch (mediaErr) { console.error(mediaErr); torchNotice = { key: 'torch-unavailable', isError: false }; } } else torchNotice = { key: 'torch-no-camera-api', isError: false }; try { const user = await ensureAnonymousAuth(); await registerParticipant(eventId, user.uid); setJoined(true); if (torchNotice) setNotice(torchNotice); if (event.status === 'running' && event.showStartTime && event.lightTimeline) synchronizeShow(event.showStartTime, event.lightTimeline as LightTimeline, event.showStartOffset ?? 0); } catch (err) { console.error(err); const reason = err instanceof Error ? err.message : ''; setNotice({ key: 'join-failed', detail: reason || undefined, isError: true }); } }
-  useEffect(() => {
-    if (!joined || !eventId) return;
-    lastHapticTimestampRef.current = 0;
-    let firstSnapshot = true;
-    return watchHapticEvent(eventId, hapticEvent => {
-      if (!hapticEvent) return;
-      if (firstSnapshot) {
-        firstSnapshot = false;
-        lastHapticTimestampRef.current = hapticEvent.timestamp;
-        return;
-      }
-      if (hapticEvent.timestamp <= lastHapticTimestampRef.current) return;
-      lastHapticTimestampRef.current = hapticEvent.timestamp;
-      triggerHaptic(hapticEvent.activeHaptic, document.visibilityState === 'visible');
-    });
-  }, [joined, eventId]);
   async function submitInteraction() { if (!eventId || !activeInteraction || sending) return; if (activeInteraction.type === 'poll' && !selectedOption) { setMessage({ key: 'choose-answer-first', isError: true }); return; } if (activeInteraction.type === 'question' && !answer.trim()) { setMessage({ key: 'enter-answer-first', isError: true }); return; } const interactionId = activeInteraction.id; setSending(true); setMessage(null); try { const uid = (await ensureAnonymousAuth()).uid; await submitSportsResponse(eventId, interactionId, uid, activeInteraction.type === 'poll' ? { optionId: selectedOption } : { answer: answer.trim().slice(0, 200) }); setSubmittedInteractionId(interactionId); setMessage({ key: 'response-submitted', isError: false }); setSelectedOption(''); setAnswer(''); } catch (err) { console.error(err); const alreadyResponded = err instanceof Error && /permission/i.test(err.message); if (alreadyResponded) { setSubmittedInteractionId(interactionId); setMessage({ key: 'already-responded', isError: false }); } else setMessage({ key: 'submit-failed', isError: true }); } finally { setSending(false); } }
-  useEffect(() => { if (!joined || !event) return; if (event.status === 'running' && event.showStartTime && event.lightTimeline) synchronizeShow(event.showStartTime, event.lightTimeline as LightTimeline, event.showStartOffset ?? 0); else { clearNextTimer(); void setFlash(false); } }, [joined, event?.status, event?.showStartTime, event?.showStartOffset, event?.lightTimeline]);
+  useEffect(() => { if (!joined || !event) return; if (event.status === 'running' && event.showStartTime && event.lightTimeline) synchronizeShow(event.showStartTime, event.lightTimeline as LightTimeline, event.showStartOffset ?? 0); else { clearNextTimer(); setFlash(false); } }, [joined, event?.status, event?.showStartTime, event?.showStartOffset, event?.lightTimeline]);
   useEffect(() => { if (!joined) return; const resync = () => { if (document.visibilityState !== 'visible' || !event) return; if (event.status === 'running' && event.showStartTime && event.lightTimeline) synchronizeShow(event.showStartTime, event.lightTimeline as LightTimeline, event.showStartOffset ?? 0); else { clearNextTimer(); void setFlash(false); } }; document.addEventListener('visibilitychange', resync); window.addEventListener('pageshow', resync); window.addEventListener('focus', resync); return () => { document.removeEventListener('visibilitychange', resync); window.removeEventListener('pageshow', resync); window.removeEventListener('focus', resync); }; }, [joined, event?.status, event?.showStartTime, event?.showStartOffset, event?.lightTimeline]);
-  useEffect(() => () => { clearNextTimer(); if (trackRef.current) { void trackRef.current.applyConstraints({ advanced: [{ torch: false } as TorchConstraints] }).catch(() => {}); trackRef.current.stop(); } }, []);
+  useEffect(() => () => { clearNextTimer(); flashCommandRef.current += 1; setLightState(false); if (trackRef.current) { void trackRef.current.applyConstraints({ advanced: [{ torch: false } as TorchConstraints] }).catch(() => {}); trackRef.current.stop(); } }, []);
   const langToggle = <button type="button" className="light-lang-toggle" onClick={toggleLanguage} aria-label="Switch language">{language === 'tr' ? 'EN' : 'TR'}</button>;
   if (!loaded) return <main className="light-page light-page-loading"><div className="light-shell"><div className="light-header"><div className="light-brand">FANCOURT360</div>{langToggle}</div><div className="light-loading ls-mobile-loading"><span className="ls-mobile-pulse-dot" />{t({ tr: 'Etkinliğe bağlanılıyor...', en: 'Connecting to show...' })}</div></div></main>;
   if (!event || !eventId) return <main className="light-page light-page-loading"><div className="light-shell"><div className="light-header"><div className="light-brand">FANCOURT360</div>{langToggle}</div><div className="light-loading">{notice ? noticeText(notice) : t({ tr: 'Etkinlik bulunamadı.', en: 'Show not found.' })}</div><button className="light-primary-button" onClick={() => navigate('/')}>{t({ tr: 'GERİ', en: 'BACK' })}</button></div></main>;
